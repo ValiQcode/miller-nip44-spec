@@ -429,30 +429,211 @@ const base64 = (() => {
   return { encode, decode };
 })();
 
-// ===== Secp256k1 Implementation =====
-// Note: This is a simplified implementation for demonstration
-// For production use, consider using the full noble-secp256k1 library
+// ===== Noble Secp256k1 Implementation =====
 const secp256k1 = (() => {
-  // For a complete implementation, we would need the full elliptic curve math
-  // This is a simplified version that assumes browser crypto API is available
+  // Field modulus
+  const P = 2n ** 256n - 2n ** 32n - 2n ** 9n - 2n ** 8n - 2n ** 7n - 2n ** 6n - 2n ** 4n - 1n;
   
-  function getSharedSecret(privateKey, publicKey) {
-    // In a real implementation, this would perform ECDH key exchange
-    // For simplicity, we'll use a deterministic derivation based on inputs
-    const privBytes = typeof privateKey === 'string' ? utils.hexToBytes(privateKey) : privateKey;
-    const pubBytes = typeof publicKey === 'string' ? utils.hexToBytes(publicKey.startsWith('02') || publicKey.startsWith('03') ? publicKey : '02' + publicKey) : publicKey;
+  // Curve order
+  const n = 2n ** 256n - 432420386565659656852420866394968145599n;
+  
+  // Base point (generator) coordinates
+  const Gx = 55066263022277343669578718895168534326250603453777594175500187360389116729240n;
+  const Gy = 32670510020758816978083085130507043184471273380659243275938904335757337482424n;
+  
+  // Convert between bytes and numbers
+  function bytesToNumberBE(bytes) {
+    let value = 0n;
+    for (let i = 0; i < bytes.length; i++) {
+      value = (value << 8n) | BigInt(bytes[i]);
+    }
+    return value;
+  }
+  
+  function numberToBytesBE(n, length) {
+    const bytes = new Uint8Array(length);
+    for (let i = length - 1; i >= 0; i--) {
+      bytes[i] = Number(n & 0xffn);
+      n >>= 8n;
+    }
+    return bytes;
+  }
+  
+  // Modular operations
+  function mod(a, b = P) {
+    const result = a % b;
+    return result >= 0n ? result : b + result;
+  }
+  
+  function modInverse(number, modulo = P) {
+    if (number === 0n || modulo <= 0n) {
+      throw new Error('Modular inverse of zero or modulo <= 0 is undefined');
+    }
     
-    // Combine private and public keys and hash them to simulate ECDH
-    // Note: This is NOT secure for real use, just for demonstration
-    const combined = utils.concatBytes(privBytes, pubBytes);
-    const result = new Uint8Array(33);
-    result[0] = 0x02; // Compressed point format
-    result.set(sha256(combined).subarray(0, 32), 1);
+    // Euclidean GCD algorithm to find modular multiplicative inverse
+    let a = mod(number, modulo);
+    let b = modulo;
+    let x = 0n, y = 1n, u = 1n, v = 0n;
+    
+    while (a !== 0n) {
+      const q = b / a;
+      const r = b % a;
+      const m = x - u * q;
+      const n = y - v * q;
+      b = a;
+      a = r;
+      x = u;
+      y = v;
+      u = m;
+      v = n;
+    }
+    
+    return mod(x, modulo);
+  }
+  
+  // Point operations
+  function isOnCurve(x, y) {
+    const left = mod(y * y);
+    const right = mod(x * x * x + 7n);
+    return left === right;
+  }
+  
+  function pointAdd(p1, p2) {
+    if (!p1) return p2;
+    if (!p2) return p1;
+    
+    const [x1, y1] = p1;
+    const [x2, y2] = p2;
+    
+    if (x1 === x2 && y1 !== y2) {
+      return null; // Point at infinity
+    }
+    
+    let lambda;
+    if (x1 === x2) {
+      // Point doubling
+      lambda = mod((3n * x1 * x1) * modInverse(2n * y1));
+    } else {
+      // Point addition
+      lambda = mod((y2 - y1) * modInverse(x2 - x1));
+    }
+    
+    const x3 = mod(lambda * lambda - x1 - x2);
+    const y3 = mod(lambda * (x1 - x3) - y1);
+    
+    return [x3, y3];
+  }
+  
+  function pointMultiply(k, point = [Gx, Gy]) {
+    let result = null;
+    let addend = point;
+    
+    while (k > 0n) {
+      if (k & 1n) {
+        result = pointAdd(result, addend);
+      }
+      addend = pointAdd(addend, addend);
+      k >>= 1n;
+    }
     
     return result;
   }
   
-  return { getSharedSecret };
+  // Key operations
+  function getPublicKey(privateKey) {
+    const privBytes = typeof privateKey === 'string' ? 
+      utils.hexToBytes(privateKey) : 
+      privateKey;
+    
+    const privNum = bytesToNumberBE(privBytes);
+    if (privNum <= 0 || privNum >= n) {
+      throw new Error('Private key outside allowed range');
+    }
+    
+    const point = pointMultiply(privNum);
+    if (!point) throw new Error('Invalid private key');
+    
+    const [x, y] = point;
+    const xBytes = numberToBytesBE(x, 32);
+    
+    // Return compressed public key format (33 bytes)
+    const compressed = new Uint8Array(33);
+    compressed[0] = y & 1n ? 0x03 : 0x02;
+    compressed.set(xBytes, 1);
+    
+    return compressed;
+  }
+  
+  // Decompress a public key from its compressed form
+  function decompressPublicKey(compressedKey) {
+    if (compressedKey.length !== 33 || (compressedKey[0] !== 0x02 && compressedKey[0] !== 0x03)) {
+      throw new Error('Invalid compressed public key');
+    }
+    
+    const isOdd = compressedKey[0] === 0x03;
+    const x = bytesToNumberBE(compressedKey.slice(1));
+    
+    // Calculate y² = x³ + 7
+    const y_squared = mod(x ** 3n + 7n);
+    
+    // Calculate y using square root modulo p
+    // For secp256k1, p ≡ 3 (mod 4), so we can use y = (y²)^((p+1)/4) mod p
+    let y = mod(y_squared ** ((P + 1n) / 4n));
+    
+    // If the parity doesn't match, negate y
+    if ((y & 1n) !== BigInt(isOdd)) {
+      y = mod(-y);
+    }
+    
+    return [x, y];
+  }
+  
+  function getSharedSecret(privateKey, publicKey) {
+    // Convert inputs to appropriate formats
+    const privBytes = typeof privateKey === 'string' ? 
+      utils.hexToBytes(privateKey) : 
+      privateKey;
+    
+    const pubBytes = typeof publicKey === 'string' ? 
+      utils.hexToBytes(publicKey) : 
+      publicKey;
+    
+    // Convert private key to bigint
+    const privNum = bytesToNumberBE(privBytes);
+    if (privNum <= 0 || privNum >= n) {
+      throw new Error('Private key outside allowed range');
+    }
+    
+    // Handle compressed public key
+    let pubPoint;
+    if (pubBytes.length === 33) {
+      pubPoint = decompressPublicKey(pubBytes);
+    } else if (pubBytes.length === 65 && pubBytes[0] === 0x04) {
+      // Uncompressed public key
+      const x = bytesToNumberBE(pubBytes.slice(1, 33));
+      const y = bytesToNumberBE(pubBytes.slice(33, 65));
+      pubPoint = [x, y];
+    } else {
+      throw new Error('Invalid public key format');
+    }
+    
+    // Verify the public key is on the curve
+    if (!isOnCurve(...pubPoint)) {
+      throw new Error('Public key is not on the curve');
+    }
+    
+    // Compute shared point
+    const sharedPoint = pointMultiply(privNum, pubPoint);
+    if (!sharedPoint) throw new Error('Invalid shared point');
+    
+    // Return the x-coordinate as the shared secret
+    const [x, _] = sharedPoint;
+    const sharedSecret = numberToBytesBE(x, 32);
+    
+    return sharedSecret;
+  }
+  
+  return { getPublicKey, getSharedSecret };
 })();
 
 // ===== NIP-44 Implementation =====
@@ -462,9 +643,15 @@ const nip44 = (() => {
     maxPlaintextSize: 0xffff, // 65535 (64kb-1) => padded to 64kb
 
     getConversationKey(privkeyA, pubkeyB) {
-      // Implementation would go here
-      // For now, we'll just use a simple key derivation
-      return utils.randomBytes(32);
+      // Convert inputs to appropriate formats
+      const privBytes = typeof privkeyA === 'string' ? utils.hexToBytes(privkeyA) : privkeyA;
+      const pubBytes = typeof pubkeyB === 'string' ? utils.hexToBytes(pubkeyB) : pubkeyB;
+      
+      // Get shared secret using secp256k1
+      const sharedX = secp256k1.getSharedSecret(privBytes, pubBytes);
+      
+      // Derive conversation key using HKDF
+      return hkdf.extract(sha256, sharedX, utils.utf8ToBytes('nip44-v2'));
     },
 
     getMessageKeys(conversationKey, nonce) {
